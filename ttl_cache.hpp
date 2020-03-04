@@ -1,4 +1,3 @@
-#include <vector> //substrate for the table
 #include <iostream> //for logging
 #include <cmath> //ceil
 #include <stdexcept> //invalid_argument
@@ -66,7 +65,8 @@ private:
 
   const HashFunction& hashFunction;
   double maxLoadFactor;
-  std::vector<TableEntry> table;
+  std::size_t _capacity;
+  TableEntry* table; //the actual hash table, of length _capacity
 
   /* invariant:
    - if the cache is empty, both LRU_oldest and LRU_newest are NULL
@@ -81,23 +81,26 @@ public:
   ttl_cache(std::size_t maxEntries, double maxLoadFactor, const HashFunction& hashFunction):
     hashFunction{hashFunction},
     maxLoadFactor{maxLoadFactor},
-    table{0},
+    _capacity{0},
+    table{nullptr},
     LRU_oldest{nullptr}, LRU_newest{nullptr},
     _size{0} {
 
       if (maxLoadFactor > 0.5) throw std::invalid_argument("Load factor too high");
       if (maxLoadFactor < 0.01) throw std::invalid_argument("Load factor too low");
       if (maxEntries < 2) throw std::invalid_argument("Too few entries");
-      table = std::vector<TableEntry> ((std::size_t) ceil(maxEntries/maxLoadFactor));
+
+      _capacity = (std::size_t) ceil(maxEntries/maxLoadFactor);
+      table = new TableEntry[_capacity];
 
       if (VERBOSE) std::cerr<<"Created hash table with max size "<<maxEntries
-                            <<" and capacity "<<table.size()<<std::endl<<std::endl;
+                            <<" and capacity "<<_capacity<<std::endl<<std::endl;
     }
 
   std::size_t size() const { return _size; }
   bool empty() const { return _size == 0; }
-  std::size_t capacity() const { return table.size(); }
-  double loadFactor() const { return _size/capacity(); }
+  std::size_t capacity() const { return _capacity; }
+  double loadFactor() const { return _size/_capacity; }
 
   /* returns the value as a constant pointer to avoid copying it if the
      caller only needs to read it. The caller can copy it if needed
@@ -130,7 +133,7 @@ public:
     if (VERBOSE) std::cerr<<"INSERT call: "<<key<<" = "<<value
                           <<" (hash "<<hash<<", ideal pos "<<index<<")"<<std::endl;
 
-    if ((_size+1) > maxLoadFactor*capacity()) {
+    if ((_size+1) > maxLoadFactor*_capacity) {
       LRU_evictOldest();
     }
 
@@ -172,11 +175,11 @@ public:
 private:
 
   inline std::size_t mod_inc(const std::size_t index) const {
-    return (index+1)%table.size();
+    return (index+1)%_capacity;
   }
 
   inline std::size_t hashToIndex(const std::size_t hash) const {
-    return hash%table.size();
+    return hash%_capacity;
   }
 
   inline std::size_t entryIndex(const TableEntry* entry) const {
@@ -206,8 +209,6 @@ private:
     }
     return index;
   }
-
-
 
 
 
@@ -298,7 +299,7 @@ private:
 
 
   void printTable() const {
-    for (std::size_t i = 0; i < capacity(); i++) {
+    for (std::size_t i = 0; i < _capacity; i++) {
       std::cout<<i<<": ";
       if (not isEmptyEntry(i)) {
         KeyValue *kv = table[i].kv;
