@@ -1,35 +1,40 @@
 #ifndef TTL_CACHE_H
 #define TTL_CACHE_H
 
-#include <iostream> //for logging
-#include <cmath> //ceil
-#include <stdexcept> //invalid_argument
+#include <iostream> //logging
 #include <cassert> //checking invariants
+#include <stdexcept> //invalid parameters in public function calls
 #include <optional> //for when a key is not in cache
+#include <cmath> //ceil
+#include <random> //to get random samples in the expire algorithm
+#include <chrono> //random seed for expire algo, default timestamp type
+#include <vector> //to store the samples in the expire algorithm
 
-/* Hash table that acts as a cache for a Key-Value storage.
+
+/* ttl_cache: a hash table that acts as a cache for a Key-Value storage.
 
    It supports the following operations:
     - insert a key-value pair
     - get the value associated with a key, if any
 
+   It implements the following mechanisms:
+
    LRU mechanism:
-    The cache stores a maximum number of pairs, specified at construction time
+    The cache stores a maximum number of kv pairs, specified at construction time
     If new insertions exceed this limit, the least recently read/written pair is deleted
 
-   TTL mechanism (not implemented yet):
-    Each key has an associated "time-to-live", after which it expires
+   TTL mechanism:
+    Each key has an associated "ttl" (time-to-live), after which it expires
     The cache offers a function to look for expired entries and remove them
     This can prevent the LRU mechanism from removing still-alive enties
 */
 
-template<class Key, class Value, class HashFunction = std::hash<Key>>
+template<class Key, class Value, class HashFunction = std::hash<Key>, class timestamp_t = long long int>
 class ttl_cache {
 
 private:
 
-  static constexpr bool VERBOSE = false; //logs the cache's changes in cerr
-
+  static constexpr bool VERBOSE = true; //logs the cache's changes to cerr
 
   /* each key-value pair is stored in this struct
      it makes a doubly-linked list ('prev' and 'next' pointers) to be able to implement the LRU mechanism
@@ -43,6 +48,15 @@ private:
       value{std::move(value)},
       next{nullptr}, prev{nullptr} {}
   };
+
+  /* to determine which entries are expired.
+     currentTime is updated through the time stamps passed to public calls (get, insert, and removeExpired)
+     note that we do not use "real time" (the chrono include is just for the random seed)
+     we only assume that the time stamps in public calls will be non-negative and increasing
+
+     timestamp_t should be a signed integer or floating point type
+  */
+  timestamp_t currentTime;
 
   /* hash table entries should be as small as possible to improve space usage
      smaller entries will also require fewer reads from memory to iterate through the
@@ -59,7 +73,7 @@ private:
   struct TableEntry {
     KeyValue *kv;
     std::size_t hash;
-    int expireTime;
+    timestamp_t expireTime;
     TableEntry(): kv{nullptr}, hash{0}, expireTime{0} {}
   };
 
@@ -80,23 +94,23 @@ private:
      with all the cached KeyValue pairs */
   KeyValue *LRU_oldest, *LRU_newest;
   std::size_t _size;
-  static constexpr int LRU_EVICTED_FLAG = -2;
+  static constexpr timestamp_t LRU_EVICTED_FLAG = -2;
 
-  /* to determine which entries are expired.
-     currentTime is updated through calls to get, insert, and removeExpired
-  */
-  int currentTime;
+  //for expire algorithm
+  std::mt19937_64 RNG;
+
 
 public:
 
   ttl_cache(std::size_t maxEntries, double maxLoadFactor, const HashFunction& hashFunction):
+    currentTime{0},
     hashFunction{hashFunction},
     maxLoadFactor{maxLoadFactor},
     _capacity{maxLoadFactor >= 0.01 ? (std::size_t) ceil(maxEntries/maxLoadFactor) : 0},
     table{nullptr},
     LRU_oldest{nullptr}, LRU_newest{nullptr},
     _size{0},
-    currentTime{0}
+    RNG{static_cast<uint64_t> (std::chrono::steady_clock::now().time_since_epoch().count())}
   {
       if (maxLoadFactor > 0.5) throw std::invalid_argument("Load factor too high");
       if (maxLoadFactor < 0.01) throw std::invalid_argument("Load factor too low");
@@ -119,20 +133,21 @@ public:
   }
 
   //getters for basic info
-  std::size_t size() const { return _size; }
+  std::size_t size() const { return _size; } //includes expired entries still in the table
   bool empty() const { return _size == 0; }
   std::size_t capacity() const { return _capacity; }
-  double loadFactor() const { return _size/_capacity; }
+  double loadFactor() const { return _size/(double) _capacity; }
+  timestamp_t currentTimeStamp() const { return currentTime; }
 
 
-  std::optional<Value> get(const Key& key, int timeStamp) {
+  std::optional<Value> get(const Key& key, timestamp_t timeStamp) {
 
     if (timeStamp < currentTime) throw std::invalid_argument("attempt to time travel");
 
     std::size_t hash = hashFunction(key);
     std::size_t idealIndex = hashToIndex(hash);
     if (VERBOSE) std::cerr<<"GET call: "<<key<<" (hash "<<hash
-                          <<", ideal pos "<<idealIndex<<")"<<std::endl;
+                          <<", ideal pos "<<idealIndex<<") [at time: "<<timeStamp<<"]"<<std::endl;
 
     currentTime = timeStamp;
     fixCluster(idealIndex);
@@ -150,7 +165,7 @@ public:
     return {};
   }
 
-  void insert(const Key& key, const Value& value, int timeStamp, int ttl) {
+  void insert(const Key& key, const Value& value, timestamp_t timeStamp, timestamp_t ttl) {
 
     if (timeStamp < currentTime) throw std::invalid_argument("attempt to time travel");
     if (ttl <= 0) throw std::invalid_argument("insertion dead on arrival");
@@ -158,7 +173,8 @@ public:
     std::size_t hash = hashFunction(key);
     std::size_t idealIndex = hashToIndex(hash);
     if (VERBOSE) std::cerr<<"INSERT call: "<<key<<" = "<<value
-                          <<" (hash "<<hash<<", ideal pos "<<idealIndex<<")"<<std::endl;
+                          <<" (hash "<<hash<<", ideal pos "<<idealIndex<<") [lifespan: "
+                          <<timeStamp<<"-"<<timeStamp+ttl<<"]"<<std::endl;
 
     currentTime = timeStamp;
     fixCluster(idealIndex);
@@ -194,18 +210,91 @@ public:
 
   }
 
-  /* Removes expired entries until the ratio of expired entries is around the expiredRatio
-     The algorithm's performance degrades when expiredRatio is small. recommended: 0.25
+  /* Expire algorithm from Redis
+     source: https://redis.io/commands/expire
+
+     Removes expired entries until the ratio of expired entries is around 'targetRatio'
+     The algorithm's performance degrades when targetRatio is small. recommended: 0.25
+
+     "1. Test 20 random keys from the set of keys with an associated expire.
+      2. Delete all the keys found expired.
+      3. If more than 25% of keys were expired, start again from step 1."
   */
-  void removeExpired(double expiredRatio) {
-    //todo
+  void removeExpired(timestamp_t timeStamp, double targetRatio) {
+
+    static constexpr double MIN_LOAD_FACTOR = 0.1;
+    static constexpr unsigned int MIN_SAMPLE_SIZE = 20;
+    static constexpr double MIN_TARGET_RATIO = 0.01;
+
+    if (timeStamp < currentTime) throw std::invalid_argument("attempt to time travel");
+    if (targetRatio < MIN_TARGET_RATIO) throw std::invalid_argument("too demanding target");
+
+    if (VERBOSE) std::cerr<<"EXPIRE call: size: "<<_size<<", load factor: "<<loadFactor()
+                          <<", target expired ratio: "<<targetRatio<<", at time: ["<<timeStamp<<"]"<<std::endl;
+
+    currentTime = timeStamp;
+    
+    double expiredRatio;
+
+    while (true) {
+
+      if (loadFactor() < MIN_LOAD_FACTOR) {
+        if (VERBOSE) std::cerr<<"expire stopped because the load factor ("<<loadFactor()<<") is"
+                              <<" so low that taking random samples is too expensive"<<std::endl;
+        break;
+      }
+      if (_size < MIN_SAMPLE_SIZE) {
+        if (VERBOSE) std::cerr<<"expire stopped because the cache does not have enough"
+                              <<" entries to take a random sample"<<std::endl;
+        break;
+      }
+
+      std::size_t beforeSize = _size;
+
+      std::vector<std::size_t> sample;
+      sample.reserve(MIN_SAMPLE_SIZE+5);
+      while (sample.size() < MIN_SAMPLE_SIZE) {
+        std::size_t index = randomIndex();
+        while (isEmpty(index)) index = randomIndex();
+
+        bool alreadySampled = std::find(sample.begin(), sample.end(), index) != sample.end();
+        if (alreadySampled) continue;
+
+        std::vector<std::size_t> cluster = clusterIndices(index);
+        std::move(cluster.begin(), cluster.end(), std::back_inserter(sample));
+        fixCluster(index); //this removes the expired entries in the cluster, updating _size in the process
+      }
+
+      unsigned int expiredCount = (beforeSize - _size);
+      expiredRatio = expiredCount / (double) sample.size(); 
+
+
+      if (VERBOSE) std::cerr<<"sampled "<<sample.size()<<" random keys, removed "<<expiredCount
+                            <<" expired keys ("<<100.0*expiredRatio<<"%)"<<std::endl;
+      if (expiredRatio <= targetRatio) break;
+    }
+
+    if (VERBOSE) std::cerr<<"EXPIRE result: size: "<<_size<<", load factor: "<<loadFactor()
+                          <<", last sample expired ratio: "<<100.0*expiredRatio<<"%"<<std::endl<<std::endl;
   }
+
 
   void print() const {
     printTable();
     std::cout<<std::endl<<"LRU order: "<<std::endl;
     printLRUOrder();
     std::cout<<std::endl;
+  }
+
+  std::vector<Key> LRU_order() {
+    std::vector<Key> res;
+    res.reserve(_size);
+    KeyValue* cur = LRU_oldest;
+    while (cur) {
+      res.push_back(cur->key);
+      cur = cur->next;
+    }    
+    return res;
   }
 
 
@@ -225,12 +314,21 @@ private:
     return _capacity; //arbitrary value outside the valid range
   }
 
+  inline std::size_t randomIndex() {
+    return (std::size_t) RNG()%_capacity;
+  }
+
   inline std::size_t hashToIndex(const std::size_t hash) const {
     return hash % _capacity;
   }
 
   inline std::size_t entryIndex(const TableEntry* entry) const {
     return (entry - &table)/sizeof(TableEntry);
+  }
+
+  inline std::size_t entryDist(const std::size_t index1, const std::size_t index2) const {
+    if (index1 <= index2) return index2 - index1;
+    return index2 + _capacity - index1;
   }
 
   inline bool isEmpty(const std::size_t index) const {
@@ -257,6 +355,26 @@ private:
     assert(not isEmpty(index));
     while (not isEmpty(prevIndex(index))) index = prevIndex(index);
     return index;
+  }
+
+  inline std::size_t clusterSize(const std::size_t index) const {
+    assert (not isEmpty(index));
+    return nextEmpty(index) - findClusterStart(index);
+  }
+
+  std::vector<std::size_t> clusterIndices(std::size_t index) const {
+    assert(not isEmpty(index));
+    std::vector<std::size_t> res;
+    while (not isEmpty(index)) { //add indices after
+      res.push_back(index);
+      index = nextIndex(index);
+    }
+    index = prevIndex(res[0]);
+    while (not isEmpty(index)) { //add indices before
+      res.push_back(index);
+      index = prevIndex(index);
+    }
+    return res;
   }
 
   inline bool isExpired(const std::size_t index) const {
@@ -303,8 +421,8 @@ private:
         if (VERBOSE) {
           if (table[index].expireTime != LRU_EVICTED_FLAG) {
             std::cerr<<"TTL: removed expired key "<<table[index].kv->key
-                     <<" (expired at "<<table[index].expireTime
-                     <<", now is "<<currentTime<<")"<<std::endl;
+                     <<" [expired at "<<table[index].expireTime
+                     <<", now is "<<currentTime<<"]"<<std::endl;
           }
         }
         removeWithoutRelocations(index);
@@ -341,13 +459,6 @@ private:
       }
       index = nextIndex(index);
     }
-
-    //pass 3: check that everything is correct
-    // index = startIndex;
-    // while (index != clusterEnd) {
-    //   if (not isEmpty(index)) assert(findKey(table[index].kv->key) != invalidIndex());
-    //   index = nextIndex(index);
-    // }
   }
 
   /* removes from the hash table and the doubly-linked list,
@@ -425,12 +536,6 @@ private:
   void LRU_evictOldest() {
     assert(_size > 0);
     std::size_t index = findKey(LRU_oldest->key);
-    if (index == invalidIndex()) {//todo: delete this if (it's only for debugging)
-      std::size_t hash = hashFunction(LRU_oldest->key);
-      std::cerr<<"oldest hash: "<<hash<<" ideal idx: "<<hashToIndex(hash)<<std::endl;
-      std::cerr<<"oldest key: "<<LRU_oldest->key<<std::endl;
-      print();
-    }
     assert(index != invalidIndex());
 
     //manipulate the expire time to make it look expired
@@ -444,15 +549,22 @@ private:
 
 
 
-
   /*** printing functions ***/
 
   void printTable() const {
+    std::cout<<"State at time ["<<currentTime<<"]"<<std::endl<<std::endl;
     for (std::size_t i = 0; i < _capacity; i++) {
       std::cout<<i<<": ";
       if (not isEmpty(i)) {
         KeyValue *kv = table[i].kv;
-        std::cout<<kv->key<<" = "<<kv->value;
+        std::size_t displacement = entryDist(hashToIndex(table[i].hash), i);
+        std::cout<<kv->key<<" = "<<kv->value<<" ";
+        if (displacement == 0) std::cout<<"(*)";
+        else std::cout<<"(+"<<displacement<<")";
+
+        std::cout<<" ["<<table[i].expireTime;
+        if (isExpired(i)) std::cout<<"!";
+        std::cout<<"]";
       }
       std::cout<<std::endl;
     }
