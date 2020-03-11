@@ -9,6 +9,7 @@
 
 #include "ttl_cache.hpp"
 #include "dummy_cache.hpp"
+#include "realtime_ttl_cache.hpp"
 
 /* sequence of operations to test the LRU mechanism.
    All the timestamps are set so no keys expire, so TTL does not interfere
@@ -173,8 +174,51 @@ void automatedCorrectnessTest() {
 }
 
 
+/* 
+
+*/
+void realTimeCacheTest() {
+
+  std::mt19937_64 RNG{static_cast<uint64_t> (std::chrono::steady_clock::now().time_since_epoch().count())};
+
+  //parameters
+  int numOperations = 2000000;
+  int numDifferentValues = 1000000;
+  int numRuns = 50;
+  int numTotalKeys = 1000;
+  std::size_t cacheMaxSize = 500;
+  double loadFactor = 0.3;
+
+  for (int i = 0; i < numRuns; i++) {
+
+    long long TTL = 2+10*i; //with each test, entries last longer and the number of hits increases
+
+    std::cout<<">> TEST ttl = "<<TTL<<" microseconds"<<std::endl;
+
+    realtime_ttl_cache<int, int, std::hash<int>, 1000000> cache(cacheMaxSize, loadFactor, std::hash<int>());
+
+    int hits = 0, misses = 0;
+    auto startTime = cache.currentTimeStamp();
+
+    for (int j = 0; j < numOperations; j++) {
+      if (j%5 == 0) { //insert
+        int key= RNG()%numTotalKeys;
+        int value = RNG()%numDifferentValues;
+        cache.insert(key, value, TTL);        
+      } else { //read
+        int key= RNG()%numTotalKeys;
+        if (cache.get(key)) hits++;
+        else misses++;
+      }
+    }
+    std::cout<<"hit ratio: "<<(hits/(double) (hits+misses))*100.0<<"%"
+             <<" (runtime: "<<(cache.currentTimeStamp()-startTime)/1000<<" ms)"<<std::endl;
+  }
+}
+
 int main() {
   // LRU_manualTest();
-  TTL_testcase();
+  // TTL_testcase();
   // automatedCorrectnessTest();
+  realTimeCacheTest();
 }

@@ -11,22 +11,23 @@
 #include <vector> //to store the samples in the expire algorithm
 
 
-/* ttl_cache: a hash table that acts as a cache for a Key-Value storage.
+/* In-memory hash table that acts as a cache for a Key-Value storage and supports timeouts.
 
-   It supports the following operations:
-    - insert a key-value pair
-    - get the value associated with a key, if any
+It supports three operations:
+- insert a key-value pair with an associated ttl (time-to-live)
+- get the value associated with a key (if it has not expired according to its ttl)
+- remove expired entries to reduce the load factor
 
-   It implements the following mechanisms:
+It implements the following mechanisms:
 
-   LRU mechanism:
-    The cache stores a maximum number of kv pairs, specified at construction time
-    If new insertions exceed this limit, the least recently read/written pair is deleted
+* **LRU**:
+The maximum number of key-value pairs is specified at construction time.
+If new insertions exceed this limit, the least recently read/written pair is deleted.
 
-   TTL mechanism:
-    Each key has an associated "ttl" (time-to-live), after which it expires
-    The cache offers a function to look for expired entries and remove them
-    This can prevent the LRU mechanism from removing still-alive enties
+* **TTL**:
+Expired entries which are still in the table are removed in two ways:
+  1. Passively, as they are discoverd through get/insert operations. 
+  2. Actively, by calling 'removeExpired'. This can prevent the LRU mechanism from removing still-alive enties.
 */
 
 template<class Key, class Value, class HashFunction = std::hash<Key>, class timestamp_t = long long int>
@@ -34,7 +35,9 @@ class ttl_cache {
 
 private:
 
-  static constexpr bool VERBOSE = true; //logs the cache's changes to cerr
+  //option to log the cache's changes to cerr. declared as a compiler-time constant so that the compiler
+  //can remove all the dead logging code when it is set to false
+  static constexpr bool VERBOSE = false;
 
   /* each key-value pair is stored in this struct
      it makes a doubly-linked list ('prev' and 'next' pointers) to be able to implement the LRU mechanism
@@ -154,6 +157,8 @@ public:
 
     std::size_t actualIndex = findKey(key, hash);
     if (actualIndex != invalidIndex()) {
+      assert(not isExpired(actualIndex));
+
       KeyValue* kv = table[actualIndex].kv;
       LRU_moveToNewest(kv);
       if (VERBOSE) std::cerr<<"GET result: found value "<< kv->value<<" for key "<<key
@@ -280,6 +285,7 @@ public:
 
 
   void print() const {
+    std::cout<<"State [at time "<<currentTime<<"]"<<std::endl<<std::endl;
     printTable();
     std::cout<<std::endl<<"LRU order: "<<std::endl;
     printLRUOrder();
@@ -322,13 +328,13 @@ private:
     return hash % _capacity;
   }
 
-  inline std::size_t entryIndex(const TableEntry* entry) const {
-    return (entry - &table)/sizeof(TableEntry);
-  }
-
   inline std::size_t entryDist(const std::size_t index1, const std::size_t index2) const {
     if (index1 <= index2) return index2 - index1;
     return index2 + _capacity - index1;
+  }
+
+  inline std::size_t entryIndex(const TableEntry* entry) const {
+    return (entry - &table)/sizeof(TableEntry);
   }
 
   inline bool isEmpty(const std::size_t index) const {
@@ -552,7 +558,6 @@ private:
   /*** printing functions ***/
 
   void printTable() const {
-    std::cout<<"State at time ["<<currentTime<<"]"<<std::endl<<std::endl;
     for (std::size_t i = 0; i < _capacity; i++) {
       std::cout<<i<<": ";
       if (not isEmpty(i)) {
